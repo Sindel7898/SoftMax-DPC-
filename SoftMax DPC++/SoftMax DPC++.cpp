@@ -11,9 +11,9 @@ using namespace sycl;
 
 void printVector(vector<double> x) {
     for (int i = 0; i < x.size(); ++i) {
-        cout << x[i] << " ";
+        std::cout << x[i] << " ";
     }
-    cout << std::endl << std::endl;
+    std::cout << std::endl << std::endl;
 }
 
 
@@ -41,18 +41,18 @@ vector<double> softmax_buffer(const vector<double>& input) {
     int NumOfElements = input.size();
 
     vector<double> output(NumOfElements);
- 
+
     queue Q(cpu_selector_v);
 
+    range<1> num_items(NumOfElements);
 
-    range<1> num_items(input.size());
     buffer<double, 1> input_buffer(input.data(), num_items);
     buffer<double, 1> output_buffer(output.data(), num_items);
 
 
     Q.submit([&](handler& h) {
 
-        auto input_accessor = input_buffer.get_access<access::mode::read>(h);
+        auto input_accessor = input_buffer.get_access<access::mode::read_write>(h);
         auto output_accessor = output_buffer.get_access<access::mode::write>(h);
 
         h.parallel_for(num_items, [=](id<1> idx) {
@@ -61,34 +61,42 @@ vector<double> softmax_buffer(const vector<double>& input) {
 
             for (int i = 0; i < NumOfElements; ++i) {
 
-                denominator += exp(input_accessor[i]);
+                atomic_ref<double, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> atomicElem(input_accessor[i]);
+                atomic_ref<double, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> atomicdenominator(denominator);
+
+                atomicdenominator += exp(atomicElem.load());
             }
 
 
             for (int i = 0; i < NumOfElements; ++i) {
 
-                output_accessor[i] = exp(input_accessor[i]) / denominator;
+                output_accessor[idx] = exp(input_accessor[idx]) / denominator;
+
             }
 
-        });
+            });
 
-    }).wait();
+        }).wait();
 
 
-    return output;
+        return output;
 
 }
 
 
+
 vector<double> softmax_USM(const vector<double>& input) {
+  
     int NumOfElements = input.size();
 
     std::vector<double> output(NumOfElements);
 
-    queue Q{ property::queue::in_order() };
+    queue Q{property::queue::in_order() };
 
     const double* input_data = input.data();
     double* output_data = output.data();
+
+    double* sharedArray = malloc_shared<double>(output_data[0], Q);
 
 
     Q.submit([&](handler& h) {
@@ -101,20 +109,24 @@ vector<double> softmax_USM(const vector<double>& input) {
             }
 
             output_data[idx] = exp(input_data[idx]) / denominator;
-            });
+        
+        });
 
     }).wait();
-    
+
+    free(sharedArray, Q);
+
     return output;
 }
 
+
+
 int main() {
 
-    int vectorSize = 4000;
+    int vectorSize = 80000;
     vector<double> input (vectorSize);
-   
+  
     const int seed = 23;
-
     srand(seed);
 
 
@@ -122,56 +134,25 @@ int main() {
         input[i] = rand() % 100;
     }
 
-    cout << "\nInput Logits: ";
-
-    printVector(input);
-
-    auto start_timebufffer = chrono::steady_clock::now(); 
-    
-    vector<double> outputbuffer = softmax_USM(input);
-
-    auto end_timebuffer = chrono::steady_clock::now(); 
-
-    auto durationbuffer = chrono::duration_cast<chrono::milliseconds>(end_timebuffer - start_timebufffer);
-
-    cout << "Execution time for Soft Max With Buffer/Accessor: " << durationbuffer.count() << " milliseconds" << std::endl;
-
-
 
     auto start_time = chrono::steady_clock::now();
 
-    vector<double> output = softmax(input);
+    vector<double> output = softmax_buffer(input);
 
     auto end_time = chrono::steady_clock::now();
-
     auto duration = chrono::duration_cast<chrono::milliseconds>(end_time - start_time);
 
-    cout << "Execution time for Soft Max RAW: " << duration.count() << " milliseconds" << std::endl;
 
-
-
-    cout << "\nSoftmax Output: ";
-    printVector(output);
-
-    cout << "\nSoftmax Output: ";
-    printVector(outputbuffer);
 
     double probabilitySum = 0;
-    double probabilitySumAcessor = 0;
 
     for (int i = 0; i < output.size(); ++i) {
+ 
         probabilitySum += output[i];
     }
 
-
-    for (int i = 0; i < output.size(); ++i) {
-        probabilitySumAcessor += outputbuffer[i];
-    }
-
-
-    cout << "\nSum of the outputs: " << probabilitySum << std::endl << std::endl;
-    cout << "\nSum of the outputs Acessor/buffer: " << probabilitySumAcessor << std::endl << std::endl;
-
+    std::cout << "\nSum of the outputs: " << probabilitySum << std::endl << std::endl;
+    std::cout << "Execution time for Soft Max RAW: " << duration.count() << " milliseconds" << std::endl;
 
     return 0;
 }
