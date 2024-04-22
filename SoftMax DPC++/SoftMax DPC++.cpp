@@ -83,7 +83,6 @@ vector<double> softmax_buffer(const vector<double>& input) {
 
 
         return output;
-
 }
 
 
@@ -165,20 +164,24 @@ vector<double> softmax_subgroups(const vector<double>& input) {
                 }
             }
 
+            item.barrier(access::fence_space::local_space);
+
             double local_output = exp(input_accessor[idx]) / denominator;
 
+            item.barrier(access::fence_space::local_space);
             output_accessor[idx] = local_output;
 
-            });
-        }).wait();
 
-        return output;
+        });
+    }).wait();
+         
+  return output;
 }
 
 
 int main() {
 
-    int vectorSize = 80000;
+    int vectorSize = 8000;
     vector<double> input (vectorSize);
   
     const int seed = 23;
