@@ -25,7 +25,7 @@ vector <double> softmax(vector<double>& input) {
     double denominator = 0;
 
     for (int i = 0; i < input.size(); ++i) {
-        
+
         exponents.push_back(exp(input[i]));
 
         denominator += exp(input[i]);
@@ -42,7 +42,7 @@ vector<double> softmax_buffer(const vector<double>& input) {
 
     vector<double> output(NumOfElements);
 
-    queue Q(cpu_selector_v);
+    queue Q(gpu_selector_v);
 
     range<1> num_items(NumOfElements);
 
@@ -81,24 +81,23 @@ vector<double> softmax_buffer(const vector<double>& input) {
 
         }).wait();
 
-
         return output;
 }
 
 
 
 vector<double> softmax_USM(const vector<double>& input) {
-  
+
     int NumOfElements = input.size();
 
     std::vector<double> output(NumOfElements);
 
-    queue Q{property::queue::in_order() };
+    queue Q(gpu_selector_v);
 
     const double* input_data = input.data();
     double* output_data = output.data();
 
-    double* sharedArray = malloc_shared<double>(output.size(), Q);
+    double* sharedArray = malloc_shared<double>(NumOfElements, Q);
 
 
     Q.submit([&](handler& h) {
@@ -107,20 +106,52 @@ vector<double> softmax_USM(const vector<double>& input) {
             double denominator = 0;
 
             for (int i = 0; i < NumOfElements; ++i) {
-                denominator += exp(input_data[i]);
+                denominator += sycl::exp(input_data[i]);
             }
 
-            output_data[idx] = exp(input_data[idx]) / denominator;
-        
-        });
+            output_data[idx] = sycl::exp(input_data[idx]) / denominator;
 
-    }).wait();
+            });
 
-    free(sharedArray, Q);
+        }).wait();
 
-    return output;
+        free(sharedArray, Q);
+
+        return output;
 }
 
+vector<double> softmax_USMTEST(const vector<double>& input) {
+
+    int NumOfElements = input.size();
+
+    std::vector<double> output(NumOfElements);
+
+    queue Q(gpu_selector_v);
+
+    const double* input_data = input.data();
+    double* output_data = output.data();
+
+    double* sharedArray = malloc_shared<double>(NumOfElements, Q);
+
+
+    Q.submit([&](handler& h) {
+
+        h.parallel_for(NumOfElements, [=](id<1> idx) {
+            double denominator = 0;
+
+            for (int i = 0; i < NumOfElements; ++i) {
+                denominator += input_data[i];
+            }
+
+
+            });
+
+        }).wait();
+
+        free(sharedArray, Q);
+
+        return output;
+}
 
 vector<double> softmax_subgroups(const vector<double>& input) {
 
@@ -134,7 +165,7 @@ vector<double> softmax_subgroups(const vector<double>& input) {
 
     buffer<double, 1> input_buffer(input.data(), num_items);
     buffer<double, 1> output_buffer(output.data(), num_items);
-    
+
     constexpr size_t Size = 9;
 
     Q.submit([&](handler& h) {
@@ -147,13 +178,13 @@ vector<double> softmax_subgroups(const vector<double>& input) {
         sycl::accessor<float, 1, access::mode::write, access::target::local> tileB(range<1>(Size), h);
 
         h.parallel_for<class SoftMax>(nd_range<1>(range<1>(NumOfElements), range<1>(Size)), [=](nd_item<1> item) {
-           
-           
+
+
 
             auto local_id = item.get_local_id(0);
             auto idx = item.get_global_id(0);
 
-            
+
             double denominator = 0;
 
             for (int i = 0; i < NumOfElements; i += NumOfElements) {
@@ -172,18 +203,18 @@ vector<double> softmax_subgroups(const vector<double>& input) {
             output_accessor[idx] = local_output;
 
 
-        });
-    }).wait();
-         
-  return output;
+            });
+        }).wait();
+
+        return output;
 }
 
 
 int main() {
 
-    int vectorSize = 8000;
-    vector<double> input (vectorSize);
-  
+    int vectorSize = 10;
+    vector<double> input(vectorSize);
+
     const int seed = 23;
     srand(seed);
 
@@ -195,7 +226,7 @@ int main() {
 
     auto start_time = chrono::steady_clock::now();
 
-    vector<double> output = softmax_subgroups(input);
+    vector<double> output = softmax_USM(input);
 
     auto end_time = chrono::steady_clock::now();
     auto duration = chrono::duration_cast<chrono::milliseconds>(end_time - start_time);
@@ -205,7 +236,7 @@ int main() {
     double probabilitySum = 0;
 
     for (int i = 0; i < output.size(); ++i) {
- 
+
         probabilitySum += output[i];
     }
 
