@@ -5,7 +5,6 @@
 #include <chrono> 
 #include <random>
 
-
 using namespace std;
 using namespace sycl;
 
@@ -42,7 +41,7 @@ vector<double> softmax_buffer(const vector<double>& input) {
 
     vector<double> output(NumOfElements);
 
-    queue Q(gpu_selector_v);
+    queue Q(cpu_selector_v);
 
     range<1> num_items(NumOfElements);
 
@@ -70,10 +69,12 @@ vector<double> softmax_buffer(const vector<double>& input) {
 
             for (int i = 0; i < NumOfElements; ++i) {
 
-                atomic_ref<double, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> InputAtomic(input_accessor[idx]);
-                atomic_ref<double, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> OutPutAtomic(output_accessor[idx]);
+                atomic_ref<double, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> InputAtomic(input_accessor[i]);
+                double current_input = InputAtomic.load();
 
-                OutPutAtomic = exp(InputAtomic.load()) / denominator;
+                atomic_ref<double, sycl::memory_order::relaxed, memory_scope::device, access::address_space::global_space> OutPutAtomic(output_accessor[i]);
+
+                OutPutAtomic = exp(current_input) / denominator;
 
             }
 
@@ -81,23 +82,22 @@ vector<double> softmax_buffer(const vector<double>& input) {
 
         }).wait();
 
+
         return output;
 }
 
-
-
-vector<double> softmax_USM(const vector<double>& input) {
+vector<double> softmax_USM_Implicit(const vector<double>& input) {
 
     int NumOfElements = input.size();
 
     std::vector<double> output(NumOfElements);
 
-    queue Q(gpu_selector_v);
+    queue Q{ property::queue::in_order() };
 
     const double* input_data = input.data();
     double* output_data = output.data();
 
-    double* sharedArray = malloc_shared<double>(NumOfElements, Q);
+    double* sharedArray = malloc_shared<double>(input.size(), Q);
 
 
     Q.submit([&](handler& h) {
@@ -106,32 +106,36 @@ vector<double> softmax_USM(const vector<double>& input) {
             double denominator = 0;
 
             for (int i = 0; i < NumOfElements; ++i) {
-                denominator += sycl::exp(input_data[i]);
+                denominator += exp(sharedArray[i]);
             }
 
-            output_data[idx] = sycl::exp(input_data[idx]) / denominator;
+            output_data[idx] = exp(sharedArray[idx]) / denominator;
 
             });
 
-        }).wait();
+    }).wait();
 
         free(sharedArray, Q);
 
         return output;
+
 }
 
-vector<double> softmax_USMTEST(const vector<double>& input) {
+vector<double> softmax_USM_Explicit(const vector<double>& input) {
 
     int NumOfElements = input.size();
 
     std::vector<double> output(NumOfElements);
 
-    queue Q(gpu_selector_v);
+    queue Q;
 
     const double* input_data = input.data();
     double* output_data = output.data();
 
-    double* sharedArray = malloc_shared<double>(NumOfElements, Q);
+    double* INPUT = malloc_device<double>(input.size(), Q);
+    double* OUTPUT = malloc_device<double>(output.size(), Q);
+
+    Q.memcpy(INPUT, input_data, sizeof(double) * NumOfElements).wait();
 
 
     Q.submit([&](handler& h) {
@@ -140,22 +144,29 @@ vector<double> softmax_USMTEST(const vector<double>& input) {
             double denominator = 0;
 
             for (int i = 0; i < NumOfElements; ++i) {
-                denominator += input_data[i];
+                denominator += exp(INPUT[i]);
             }
 
+            OUTPUT[idx] = exp(INPUT[idx]) / denominator;
 
             });
 
         }).wait();
 
-        free(sharedArray, Q);
+        std::vector<double> host_data(NumOfElements);
 
-        return output;
+        Q.memcpy(host_data.data(), OUTPUT, sizeof(double) * NumOfElements).wait();
+
+
+        free(INPUT, Q);
+        free(OUTPUT, Q);
+
+        return host_data;
 }
 
 vector<double> softmax_subgroups(const vector<double>& input) {
 
-    int NumOfElements = input.size();
+    const size_t NumOfElements = input.size();
 
     vector<double> output(NumOfElements);
 
@@ -166,7 +177,7 @@ vector<double> softmax_subgroups(const vector<double>& input) {
     buffer<double, 1> input_buffer(input.data(), num_items);
     buffer<double, 1> output_buffer(output.data(), num_items);
 
-    constexpr size_t Size = 9;
+    const size_t Size = 9;
 
     Q.submit([&](handler& h) {
 
@@ -187,21 +198,22 @@ vector<double> softmax_subgroups(const vector<double>& input) {
 
             double denominator = 0;
 
-            for (int i = 0; i < NumOfElements; i += NumOfElements) {
+            for (int i = 0; i < NumOfElements; i++) {
                 const int local_idx = local_id + i;
 
-                if (local_idx < NumOfElements) {
-                    denominator += exp(input_accessor[local_idx]);
-                }
+
+                tileA[local_id] = sycl::exp(input_accessor[local_idx]);
+                item.barrier(access::fence_space::local_space);
+
+                denominator += sycl::exp(input_accessor[local_idx]);
             }
 
             item.barrier(access::fence_space::local_space);
 
-            double local_output = exp(input_accessor[idx]) / denominator;
+            double local_output = sycl::exp(input_accessor[idx]) / denominator;
 
             item.barrier(access::fence_space::local_space);
             output_accessor[idx] = local_output;
-
 
             });
         }).wait();
@@ -212,7 +224,7 @@ vector<double> softmax_subgroups(const vector<double>& input) {
 
 int main() {
 
-    int vectorSize = 10;
+    int vectorSize = 9000;
     vector<double> input(vectorSize);
 
     const int seed = 23;
@@ -226,7 +238,7 @@ int main() {
 
     auto start_time = chrono::steady_clock::now();
 
-    vector<double> output = softmax_USM(input);
+    vector<double> output = softmax_subgroups(input);
 
     auto end_time = chrono::steady_clock::now();
     auto duration = chrono::duration_cast<chrono::milliseconds>(end_time - start_time);
